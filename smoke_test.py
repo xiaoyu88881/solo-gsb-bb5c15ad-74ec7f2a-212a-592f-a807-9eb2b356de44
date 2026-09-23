@@ -244,6 +244,108 @@ with TestClient(app) as client:
     print("15) untargeted/zero-target handling ok")
 
     # =================================================================== #
+    # Source-water mineral baseline (source_water)
+    # =================================================================== #
+    # 10 L, target Ca=145 mg/L (1450 mg); concentrate C has Ca=1000 mg/L
+    # (1 mg/mL), source water carries Ca=50 mg/L (0.05 mg/mL).
+    # Exact solution: 1000 mL concentrate + 9000 mL water
+    #   Ca = 1000*1 + 9000*0.05 = 1000 + 450 = 1450 mg = 145 mg/L
+    sw = {
+        "target_volume_ml": 10000,
+        "targets": {"concentrations": {"Ca": 145}},
+        "concentrates": [
+            {"name": "C液", "available_volume": 5000,
+             "concentrations": {"Ca": 1000}},
+        ],
+        "tolerance": 0.05,
+        "source_water": {"concentrations": {"Ca": 50}},
+    }
+
+    # 15c) baseline counts toward delivered amount -> less concentrate ---- #
+    r = client.post("/api/solve", json=sw)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["feasible"] is True, data
+    assert abs(data["allocations"][0]["volume_ml"] - 1000) < 1e-4, data
+    assert abs(data["water_volume_ml"] - 9000) < 1e-4, data
+    ca = [e for e in data["elements"] if e["element"] == "Ca"][0]
+    assert abs(ca["source_water_contribution_mg"] - 450.0) < 1e-4, ca
+    assert abs(ca["actual_amount_mg"] - 1450.0) < 1e-4, ca
+    assert ca["status"] == "ok"
+    print("15c) source water baseline:", ca["actual_amount_mg"], "mg =",
+          "1000 concentrate +", ca["source_water_contribution_mg"], "water")
+
+    # 15d) omitted source_water behaves exactly as before (zero baseline) - #
+    sw_none = {k: v for k, v in sw.items() if k != "source_water"}
+    data = client.post("/api/solve", json=sw_none).json()
+    assert data["feasible"] is True, data
+    ca = data["elements"][0]
+    assert ca["source_water_contribution_mg"] == 0.0
+    assert abs(data["allocations"][0]["volume_ml"] - 1450) < 1e-4, data
+    print("15d) no source_water -> contribution 0, concentrate 1450 mL")
+
+    # 15e) surplus bound uses the same model: even with zero concentrate
+    #      the source water alone overshoots the Ca upper band ------------ #
+    sw_over = dict(sw)
+    sw_over["targets"] = {"concentrations": {"Ca": 40}}  # 400 mg, upper 420
+    data = client.post("/api/solve", json=sw_over).json()
+    assert data["feasible"] is False, data
+    v = [v for v in data["violations"] if v["code"] == "ELEMENT_SURPLUS"]
+    assert v and v[0]["element"] == "Ca", data["violations"]
+    # min Ca = 10000 mL all-water * 0.05 mg/mL = 500 mg (concentrate adds
+    # only more, since its Ca coefficient 1 mg/mL > water's 0.05)
+    assert abs(v[0]["actual"] - 500.0) < 1e-4, v
+    print("15e) surplus bound includes source water:", v[0]["message"])
+
+    # 15f) shortage bound uses the same model: capped concentrate + water --
+    sw_short = dict(sw)
+    sw_short["targets"] = {"concentrations": {"Ca": 100}}  # 1000 mg, lower 950
+    sw_short["concentrates"] = [
+        {"name": "C液", "available_volume": 400,
+         "concentrations": {"Ca": 1000}},
+    ]
+    data = client.post("/api/solve", json=sw_short).json()
+    assert data["feasible"] is False, data
+    v = [v for v in data["violations"] if v["code"] == "ELEMENT_SHORTAGE"]
+    assert v and v[0]["element"] == "Ca", data["violations"]
+    # max Ca = 400 mL * 1 mg/mL + 9600 mL * 0.05 mg/mL = 400 + 480 = 880 mg
+    assert abs(v[0]["actual"] - 880.0) < 1e-4, v
+    print("15f) shortage bound includes source water:", v[0]["message"])
+
+    # 15g) source_water validation: negative / unknown element -> 422,
+    #      keys are case-insensitive -------------------------------------- #
+    bad_sw = base_request()
+    bad_sw["source_water"] = {"concentrations": {"N": -1}}
+    assert client.post("/api/solve", json=bad_sw).status_code == 422
+    bad_sw["source_water"] = {"concentrations": {"Xx": 1}}
+    assert client.post("/api/solve", json=bad_sw).status_code == 422
+    bad_sw["source_water"] = {"concentrations": {"ca": 10}}
+    r = client.post("/api/solve", json=bad_sw)
+    assert r.status_code == 200, r.text
+    ca = [e for e in r.json()["elements"] if e["element"] == "Ca"]
+    assert not ca  # Ca not targeted -> no row; baseline just applies to targets
+    n_row = [e for e in r.json()["elements"] if e["element"] == "N"][0]
+    assert n_row["source_water_contribution_mg"] == 0.0
+    print("15g) source_water validation + normalization ok")
+
+    # 15h) saved versions and exports keep the source_water input --------- #
+    r = client.post("/api/recipes", json={
+        "name": "原水配方", "note": "v1", "request": sw})
+    assert r.status_code == 201, r.text
+    assert r.json()["request"]["source_water"]["concentrations"] == {"Ca": 50.0}
+    sw_rid = r.json()["recipe_id"]
+    got = client.get(f"/api/recipes/{sw_rid}/versions/1").json()
+    assert got["request"]["source_water"]["concentrations"] == {"Ca": 50.0}
+    exp = client.get(f"/api/recipes/{sw_rid}/versions/1/export").json()
+    assert exp["version"]["request"]["source_water"]["concentrations"] == {
+        "Ca": 50.0}
+    ca = [e for e in exp["version"]["result"]["elements"]
+          if e["element"] == "Ca"][0]
+    assert ca["source_water_contribution_mg"] == 450.0
+    print("15h) saved version + export keep source_water input")
+
+
+    # =================================================================== #
     # Irrigation plan (POST /api/irrigation/plan)
     # =================================================================== #
     def irr_body(**overrides) -> dict:

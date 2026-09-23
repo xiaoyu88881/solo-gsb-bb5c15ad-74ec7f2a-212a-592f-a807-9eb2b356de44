@@ -15,6 +15,27 @@ from pydantic import (
 from .config import DEFAULT_TOLERANCE, ELEMENTS, normalize_element
 
 
+def _normalize_concentrations(
+    concentrations: dict[str, float], noun: str
+) -> dict[str, float]:
+    """Validate/normalize an element -> concentration (mg/L) map.
+
+    Element keys are case-insensitive and must be known; values must be
+    non-negative. ``noun`` labels the map in error messages (浓度/目标/…).
+    """
+    normalized: dict[str, float] = {}
+    for key, val in concentrations.items():
+        elem = normalize_element(key)
+        if elem is None:
+            raise ValueError(
+                f"未知元素 '{key}'，支持: {', '.join(ELEMENTS)}"
+            )
+        if val < 0:
+            raise ValueError(f"元素 {elem} {noun}不能为负")
+        normalized[elem] = float(val)
+    return normalized
+
+
 class Concentrate(BaseModel):
     """One stock concentrate bottle.
 
@@ -42,17 +63,7 @@ class Concentrate(BaseModel):
     @field_validator("concentrations")
     @classmethod
     def _validate_concentrations(cls, v: dict[str, float]) -> dict[str, float]:
-        normalized: dict[str, float] = {}
-        for key, val in v.items():
-            elem = normalize_element(key)
-            if elem is None:
-                raise ValueError(
-                    f"未知元素 '{key}'，支持: {', '.join(ELEMENTS)}"
-                )
-            if val < 0:
-                raise ValueError(f"元素 {elem} 浓度不能为负")
-            normalized[elem] = float(val)
-        return normalized
+        return _normalize_concentrations(v, "浓度")
 
 
 class Targets(BaseModel):
@@ -65,17 +76,28 @@ class Targets(BaseModel):
     @field_validator("concentrations")
     @classmethod
     def _validate_targets(cls, v: dict[str, float]) -> dict[str, float]:
-        normalized: dict[str, float] = {}
-        for key, val in v.items():
-            elem = normalize_element(key)
-            if elem is None:
-                raise ValueError(
-                    f"未知元素 '{key}'，支持: {', '.join(ELEMENTS)}"
-                )
-            if val < 0:
-                raise ValueError(f"元素 {elem} 目标不能为负")
-            normalized[elem] = float(val)
-        return normalized
+        return _normalize_concentrations(v, "目标")
+
+
+class SourceWater(BaseModel):
+    """原水（稀释用水）中各元素的基线浓度 mg/L。
+
+    求解时按 LP 实际求得的稀释水量折算贡献：
+    元素 e 的原水贡献 mg = 浓度 mg/L × 稀释水量 mL ÷ 1000，
+    而不是按目标总体积预扣一个固定水量。
+    """
+
+    concentrations: dict[str, float] = Field(
+        default_factory=dict,
+        description="原水中各元素浓度 mg/L，键如 N/P/K/Ca/Mg ...",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("concentrations")
+    @classmethod
+    def _validate_concentrations(cls, v: dict[str, float]) -> dict[str, float]:
+        return _normalize_concentrations(v, "原水浓度")
 
 
 class SolveRequest(BaseModel):
@@ -99,6 +121,13 @@ class SolveRequest(BaseModel):
         le=1,
         description="可接受的最大相对偏差；超过则在 violations 中列出",
     )
+    source_water: Optional[SourceWater] = Field(
+        None,
+        description=(
+            "原水（稀释用水）矿物质基线；缺省按纯水处理（各元素贡献为 0）。"
+            "元素实际量 = 浓缩液贡献 + 原水浓度 × 求得的稀释水量"
+        ),
+    )
 
     model_config = ConfigDict(extra="forbid")
 
@@ -116,7 +145,12 @@ class ElementResult(BaseModel):
     target_concentration: float
     actual_concentration: float
     target_amount_mg: float
-    actual_amount_mg: float
+    actual_amount_mg: float = Field(
+        ..., description="总实际量 mg = 浓缩液贡献 + 原水贡献"
+    )
+    source_water_contribution_mg: float = Field(
+        ..., description="原水贡献量 mg = 原水浓度 × 求得的稀释水量；未传原水时为 0"
+    )
     relative_deviation: Optional[float]
     status: str  # ok | under | over | unconstrained
 
