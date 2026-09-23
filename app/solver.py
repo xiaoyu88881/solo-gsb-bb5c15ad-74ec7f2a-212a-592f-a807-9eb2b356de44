@@ -4,7 +4,11 @@ The problem is modelled as a linear program (mL for volumes, mg for amounts):
 
 * variables: ``x_i`` - used volume (mL) of each concentrate,
   ``w`` - dilution water (mL), ``t`` - worst-case relative deviation.
-* delivered amount of element ``e``: ``sum_i c_{i,e} * x_i / 1000`` (mg)
+* delivered amount of element ``e`` (mg):
+  ``sum_i c_{i,e} * x_i / 1000 + s_e * w / 1000``
+  where ``s_e`` is the raw-water baseline concentration (mg/L); the source
+  water contributes in proportion to the *solved* water volume ``w`` rather
+  than a fixed amount pre-deducted from the target volume.
 * target amount: ``target_concentration_e * V / 1000`` (mg)
 
 Hard constraints
@@ -60,6 +64,9 @@ def solve(req: SolveRequest) -> SolveResult:
     A = np.zeros((n, len(_elems(req))), dtype=float)
     elem_index = _build_element_matrix(req, A)
 
+    # raw-water baseline mg per mL of dilution water: s [mg/L] / 1000
+    source = _source_vector(req, elem_index)
+
     targets = {
         e: float(v) * V / 1000.0
         for e, v in req.targets.concentrations.items()
@@ -69,15 +76,15 @@ def solve(req: SolveRequest) -> SolveResult:
     hard = _hard_volume_checks(req, caps)
     if hard:
         return _infeasible_result(
-            req, caps, A, elem_index, targets, hard,
+            req, caps, A, elem_index, source, targets, hard,
             "硬约束冲突，不存在满足体积/稀释水约束的配比。",
         )
 
     # -- 2. minimax LP ----------------------------------------------------- #
-    res = _minimax_lp(req, caps, A, elem_index, targets)
+    res = _minimax_lp(req, caps, A, elem_index, source, targets)
     if res is None:
         return _infeasible_result(
-            req, caps, A, elem_index, targets,
+            req, caps, A, elem_index, source, targets,
             [_violation("SOLVER_ERROR", "求解器未能完成计算。")],
             "求解失败，请检查输入参数。",
         )
@@ -88,7 +95,7 @@ def solve(req: SolveRequest) -> SolveResult:
     tol = req.tolerance
 
     elements, max_dev = _element_report(
-        req, caps, A, elem_index, targets, x
+        req, A, elem_index, source, targets, x, w
     )
     allocations = [
         {
@@ -115,10 +122,10 @@ def solve(req: SolveRequest) -> SolveResult:
 
     # -- 3. diagnose why the tolerance band cannot be met ------------------ #
     violations = _diagnose(
-        req, caps, A, elem_index, targets, x, t_star
+        req, caps, A, elem_index, source, targets, x, w, t_star
     )
     return _infeasible_result(
-        req, caps, A, elem_index, targets, violations,
+        req, caps, A, elem_index, source, targets, violations,
         (
             f"无可行解：最优最大相对偏差为 {t_star:.2%}，"
             f"超过容差 {tol:.2%}，详见 violations。"
@@ -143,6 +150,10 @@ def _elems(req: SolveRequest) -> list[str]:
     for e in req.targets.concentrations:
         if e not in seen:
             seen.append(e)
+    if req.source_water is not None:
+        for e in req.source_water.concentrations:
+            if e not in seen:
+                seen.append(e)
     return seen
 
 
@@ -155,6 +166,17 @@ def _build_element_matrix(req: SolveRequest, A: np.ndarray) -> dict[str, int]:
         for e, conc in c.concentrations.items():
             A[i, index[e]] = conc / 1000.0
     return index
+
+
+def _source_vector(
+    req: SolveRequest, elem_index: dict[str, int]
+) -> np.ndarray:
+    """Source-water baseline per element (mg per mL of dilution water)."""
+    s = np.zeros(len(elem_index), dtype=float)
+    if req.source_water is not None:
+        for e, conc in req.source_water.concentrations.items():
+            s[elem_index[e]] = conc / 1000.0
+    return s
 
 
 def _hard_polytope(
@@ -188,6 +210,7 @@ def _minimax_lp(
     caps: np.ndarray,
     A: np.ndarray,
     elem_index: dict[str, int],
+    source: np.ndarray,
     targets: dict[str, float],
 ):
     n = len(caps)
@@ -200,15 +223,18 @@ def _minimax_lp(
         if T <= _EPS:
             continue
         a = A[:, elem_index[e]]
-        # delivered <= T(1+t)  ->  a·x - T t <= T
+        s = source[elem_index[e]]
+        # delivered = a·x + s*w <= T(1+t)  ->  a·x + s·w - T t <= T
         row_up = np.zeros(dim)
         row_up[:n] = a
+        row_up[n] = s
         row_up[n + 1] = -T
         rows.append(row_up)
         rhs.append(T)
-        # delivered >= T(1-t)  ->  -a·x - T t <= -T
+        # delivered >= T(1-t)  ->  -a·x - s·w - T t <= -T
         row_lo = np.zeros(dim)
         row_lo[:n] = -a
+        row_lo[n] = -s
         row_lo[n + 1] = -T
         rows.append(row_lo)
         rhs.append(-T)
@@ -231,13 +257,17 @@ def _extreme_element(
     req: SolveRequest,
     caps: np.ndarray,
     elem_col: np.ndarray,
+    source_coef: float,
     maximize: bool,
     extra_rows: Optional[list[tuple[np.ndarray, float]]] = None,
 ):
     """Min/max deliverable amount of one element inside the hard polytope.
 
-    ``extra_rows`` adds (coefficient row over x, rhs) inequalities a·x <= b.
-    Returns (value, x) or None if infeasible.
+    The delivered amount is ``elem_col·x + source_coef * w`` (concentrate
+    contribution plus raw-water baseline over the solved water volume).
+
+    ``extra_rows`` adds (coefficient row over z=(x..., w), rhs) inequalities
+    ``row·z <= b``.  Returns (value, z) or None if infeasible.
     """
     n = len(caps)
     dim = n + 1
@@ -245,13 +275,13 @@ def _extreme_element(
     rows = [A_ub]
     rhs = list(b_ub)
     for row, b in extra_rows or []:
-        full = np.zeros(dim)
-        full[:n] = row
-        rows.append(full)
+        rows.append(row)
         rhs.append(b)
 
+    # objective on the delivered amount: [elem_col, source_coef] · z
     c_obj = np.zeros(dim)
     c_obj[:n] = -elem_col if maximize else elem_col
+    c_obj[n] = -source_coef if maximize else source_coef
     res = linprog(
         c=c_obj,
         A_ub=np.vstack(rows),
@@ -263,8 +293,8 @@ def _extreme_element(
     )
     if not res.success:
         return None
-    value = float(elem_col @ res.x[:n])
-    return value, res.x[:n]
+    value = float(elem_col @ res.x[:n] + source_coef * res.x[n])
+    return value, res.x
 
 
 # --------------------------------------------------------------------------- #
@@ -310,20 +340,28 @@ def _diagnose(
     caps: np.ndarray,
     A: np.ndarray,
     elem_index: dict[str, int],
+    source: np.ndarray,
     targets: dict[str, float],
     x_star: np.ndarray,
+    w_star: float,
     t_star: float,
 ) -> list[dict]:
     tol = req.tolerance
     concentrates = req.concentrates
+    n = len(concentrates)
     violations: list[dict] = []
     explained: set[str] = set()
+
+    def _delivered(a: np.ndarray, s: float, z: np.ndarray) -> float:
+        return float(a @ z[:n] + s * z[n])
 
     for e, T in targets.items():
         if T <= _EPS:
             continue
         a = A[:, elem_index[e]]
-        delivered = float(a @ x_star)
+        s = source[elem_index[e]]
+        z_star = np.concatenate([x_star, [w_star]])
+        delivered = _delivered(a, s, z_star)
         lower_band = T * (1.0 - tol)
         upper_band = T * (1.0 + tol)
 
@@ -332,15 +370,15 @@ def _diagnose(
 
         if delivered < lower_band - _EPS:
             # --- shortage: even using every bottle to its cap ----------- #
-            extreme = _extreme_element(req, caps, a, maximize=True)
+            extreme = _extreme_element(req, caps, a, s, maximize=True)
             if extreme is None:
                 continue
-            max_amount, x_max = extreme
+            max_amount, z_max = extreme
             if max_amount < lower_band - _EPS:
                 binding = [
                     concentrates[i].name
-                    for i in range(len(concentrates))
-                    if x_max[i] >= caps[i] - _BIND_EPS and a[i] > _EPS
+                    for i in range(n)
+                    if z_max[i] >= caps[i] - _BIND_EPS and a[i] > _EPS
                 ]
                 reason = "受浓缩液可用体积/单液使用量上限约束"
                 if binding:
@@ -364,14 +402,20 @@ def _diagnose(
             # --- surplus: force every OTHER target element to at least
             # its lower band, then minimize this element ----------------- #
             extra: list[tuple[np.ndarray, float]] = []
+            dim = n + 1
             for other, To in targets.items():
                 if other == e or To <= _EPS:
                     continue
                 ao = A[:, elem_index[other]]
-                # delivered_other >= To(1-tol)  ->  -ao·x <= -lower
-                extra.append((-ao, -To * (1.0 - tol)))
+                so = source[elem_index[other]]
+                # delivered_other >= To(1-tol)
+                #   ->  -ao·x - so·w <= -lower
+                row = np.zeros(dim)
+                row[:n] = -ao
+                row[n] = -so
+                extra.append((row, -To * (1.0 - tol)))
             extreme = _extreme_element(
-                req, caps, a, maximize=False, extra_rows=extra
+                req, caps, a, s, maximize=False, extra_rows=extra
             )
             if extreme is not None:
                 min_amount, _ = extreme
@@ -399,7 +443,8 @@ def _diagnose(
         if T <= _EPS or e in explained:
             continue
         a = A[:, elem_index[e]]
-        delivered = float(a @ x_star)
+        s = source[elem_index[e]]
+        delivered = float(a @ x_star + s * w_star)
         lower_band = T * (1.0 - tol)
         upper_band = T * (1.0 + tol)
         if delivered < lower_band - _EPS or delivered > upper_band + _EPS:
@@ -435,11 +480,12 @@ def _diagnose(
 # --------------------------------------------------------------------------- #
 def _element_report(
     req: SolveRequest,
-    caps: np.ndarray,
     A: np.ndarray,
     elem_index: dict[str, int],
+    source: np.ndarray,
     targets: dict[str, float],
     x: np.ndarray,
+    w: float,
 ) -> tuple[list[dict], Optional[float]]:
     V = req.target_volume_ml
     tol = req.tolerance
@@ -447,7 +493,12 @@ def _element_report(
     max_dev: Optional[float] = None
 
     for e, T_mg in targets.items():
-        actual_mg = float(A[:, elem_index[e]] @ x) if e in elem_index else 0.0
+        j = elem_index.get(e)
+        concentrate_mg = (
+            float(A[:, j] @ x) if j is not None else 0.0
+        )
+        source_mg = float(source[j] * w) if j is not None else 0.0
+        actual_mg = concentrate_mg + source_mg
         target_conc = T_mg * 1000.0 / V
         actual_conc = actual_mg * 1000.0 / V
         if T_mg > _EPS:
@@ -464,6 +515,8 @@ def _element_report(
                     "actual_concentration": round(actual_conc, 6),
                     "target_amount_mg": round(T_mg, 6),
                     "actual_amount_mg": round(actual_mg, 6),
+                    "concentrate_amount_mg": round(concentrate_mg, 6),
+                    "source_water_amount_mg": round(source_mg, 6),
                     "relative_deviation": round(dev, 6),
                     "status": status,
                 }
@@ -476,6 +529,8 @@ def _element_report(
                     "actual_concentration": round(actual_conc, 6),
                     "target_amount_mg": 0.0,
                     "actual_amount_mg": round(actual_mg, 6),
+                    "concentrate_amount_mg": round(concentrate_mg, 6),
+                    "source_water_amount_mg": round(source_mg, 6),
                     "relative_deviation": None,
                     "status": "unconstrained",
                 }
@@ -488,6 +543,7 @@ def _infeasible_result(
     caps: np.ndarray,
     A: np.ndarray,
     elem_index: dict[str, int],
+    source: np.ndarray,
     targets: dict[str, float],
     violations: list[dict],
     message: str,
@@ -502,7 +558,7 @@ def _infeasible_result(
         w = req.target_volume_ml
     if elements is None:
         elements, max_dev = _element_report(
-            req, caps, A, elem_index, targets, x
+            req, A, elem_index, source, targets, x, float(w)
         )
     if allocations is None:
         allocations = [

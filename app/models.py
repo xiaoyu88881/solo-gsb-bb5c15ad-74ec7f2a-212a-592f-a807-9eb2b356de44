@@ -78,10 +78,50 @@ class Targets(BaseModel):
         return normalized
 
 
+class SourceWater(BaseModel):
+    """Raw (source) water mineral baseline concentrations (mg/L).
+
+    The dilution water is not necessarily distilled: it may already carry
+    some of the tracked elements.  These concentrations contribute to the
+    final solution in proportion to the *solved* dilution water volume,
+    i.e. ``source_amount_e = source_concentration_e * w / 1000`` (mg).
+    """
+
+    concentrations: dict[str, float] = Field(
+        default_factory=dict,
+        description="原水各元素本底浓度 mg/L，键如 Ca/Mg/...",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("concentrations")
+    @classmethod
+    def _validate_source(cls, v: dict[str, float]) -> dict[str, float]:
+        normalized: dict[str, float] = {}
+        for key, val in v.items():
+            elem = normalize_element(key)
+            if elem is None:
+                raise ValueError(
+                    f"未知元素 '{key}'，支持: {', '.join(ELEMENTS)}"
+                )
+            if val < 0:
+                raise ValueError(f"元素 {elem} 原水浓度不能为负")
+            normalized[elem] = float(val)
+        return normalized
+
+
 class SolveRequest(BaseModel):
     target_volume_ml: float = Field(..., gt=0, description="目标配方总体积 (mL)")
     targets: Targets
     concentrates: list[Concentrate] = Field(..., min_length=1)
+    source_water: Optional[SourceWater] = Field(
+        None,
+        description=(
+            "原水矿物质基线（各元素浓度 mg/L）。可选，未传时按零处理；"
+            "原水贡献随求得的稀释水量线性计入各元素实际量，"
+            "不会按目标总体积预扣固定原水量。"
+        ),
+    )
     min_water_ml: float = Field(
         0,
         ge=0,
@@ -117,6 +157,16 @@ class ElementResult(BaseModel):
     actual_concentration: float
     target_amount_mg: float
     actual_amount_mg: float
+    concentrate_amount_mg: float = Field(
+        ..., description="浓缩液合计贡献的该元素量 (mg)"
+    )
+    source_water_amount_mg: float = Field(
+        ...,
+        description=(
+            "原水本底贡献的该元素量 (mg) = 原水浓度 × 求得稀释水量 ÷ 1000；"
+            "未传原水基线时为 0"
+        ),
+    )
     relative_deviation: Optional[float]
     status: str  # ok | under | over | unconstrained
 

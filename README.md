@@ -9,6 +9,7 @@
 - **总量约束**：浓缩液 + 稀释水 = 目标配方体积；浓缩液合计占比可设上限。
 - **单液上限**：每瓶浓缩液用量不超过其可用体积（可另设 `max_volume`）。
 - **稀释水约束**：可设稀释水最小用量（强制保留稀释空间）。
+- **原水矿物质基线**（可选）：稀释水本身可能含有矿物质，可通过 `source_water` 传入原水各元素浓度（mg/L）；每个元素的实际量按 **浓缩液贡献 + 原水浓度 × 求得的稀释水量** 计算（原水贡献随求解出的水量线性变化，**不会**按目标总体积预扣一笔固定原水量）。未传时按零处理。
 
 当容差范围内无可行解时，会在 `violations` 中返回**具体超限元素与原因**（瓶子到顶导致供给不足、或成分配比耦合导致某元素无法压低等），并附带最优折中方案供参考。
 
@@ -58,7 +59,8 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 - 体积：**mL**；元素浓度：**mg/L**（以纯元素计，如 N、P、K、Ca、Mg…）。
 - 目标量（mg）= 目标浓度 × 目标体积 ÷ 1000。
-- 元素键大小写不敏感（`n`、`ca`、`FE` 都会归一化）；支持 `N/P/K/Ca/Mg/S/Fe/Mn/Zn/B/Cu/Mo`；拼错字段名（如把 `concentrations` 写成 `concentrates`）会直接返回 422 而不是被静默忽略。
+- 传入 `source_water` 时，元素实际量（mg）= 浓缩液浓度 × 浓缩液用量 ÷ 1000 **+ 原水浓度 × 求得稀释水量 ÷ 1000**；响应中按元素分别给出 `concentrate_amount_mg`（浓缩液贡献）、`source_water_amount_mg`（原水贡献）与合计 `actual_amount_mg`。
+- 元素键大小写不敏感（`n`、`ca`、`FE` 都会归一化，`source_water` 同理）；支持 `N/P/K/Ca/Mg/S/Fe/Mn/Zn/B/Cu/Mo`；拼错字段名（如把 `concentrations` 写成 `concentrates`）会直接返回 422 而不是被静默忽略。
 
 ## curl 示例
 
@@ -139,6 +141,68 @@ curl -s http://localhost:8000/api/solve \
 - `ELEMENT_SURPLUS` —— 满足其他元素下限时该元素必然超量（浓缩液成分耦合）；
 - `ELEMENT_DEVIATION` —— 多个元素互相制约，最优折中仍超出容差；
 - `TOLERANCE_UNREACHABLE` —— 兜底说明。
+
+### 2b. 原水矿物质基线（`source_water`）
+
+自来水 / 井水本身往往含钙镁等矿物质。用 `source_water` 传入原水各元素浓度后，求解器把**原水浓度 × 求得的稀释水量**计入该元素的实际配出量，从而减少（甚至不再需要）相应浓缩液；minimax 容差、体积等式、单液上限等语义完全不变。
+
+目标：配 10 L 工作液，Ca=100、Mg=40 mg/L；原水实测 Ca=40、Mg=30 mg/L；浓缩液 C 含 Ca=640、Mg=130 mg/L，最多占总体积 20%。
+
+> 该组数据存在精确解：**C 液 1000 mL + 原水 9000 mL**
+> Ca：1000 mL × 640 mg/L ÷ 1000 + 9000 mL × 40 mg/L ÷ 1000 = **640 + 360 = 1000 mg**
+> Mg：1000 mL × 130 mg/L ÷ 1000 + 9000 mL × 30 mg/L ÷ 1000 = **130 + 270 = 400 mg**
+>
+> 注意原水贡献是 **40 mg/L × 求得的 9000 mL = 360 mg**，而不是按目标总体积预扣的 40 mg/L × 10 L = 400 mg——稀释水量本身是求解结果（浓缩液占了 1000 mL）。
+
+```bash
+curl -s http://localhost:8000/api/solve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target_volume_ml": 10000,
+    "targets": {"concentrations": {"Ca": 100, "Mg": 40}},
+    "concentrates": [
+      {"name": "C液", "available_volume": 2000,
+       "concentrations": {"Ca": 640, "Mg": 130}}
+    ],
+    "source_water": {"concentrations": {"ca": 40, "mg": 30}},
+    "max_concentrate_fraction": 0.20,
+    "tolerance": 0.05
+  }'
+```
+
+返回（节选）按元素同时给出**浓缩液贡献、原水贡献与合计实际量**：
+
+```json
+{
+  "feasible": true,
+  "water_volume_ml": 9000.0,
+  "concentrate_total_ml": 1000.0,
+  "allocations": [
+    {"concentrate": "C液", "volume_ml": 1000.0, "cap_ml": 2000.0}
+  ],
+  "elements": [
+    {"element": "Ca", "target_concentration": 100.0, "actual_concentration": 100.0,
+     "target_amount_mg": 1000.0,
+     "concentrate_amount_mg": 640.0,
+     "source_water_amount_mg": 360.0,
+     "actual_amount_mg": 1000.0,
+     "relative_deviation": 0.0, "status": "ok"},
+    {"element": "Mg", "target_concentration": 40.0, "actual_concentration": 40.0,
+     "target_amount_mg": 400.0,
+     "concentrate_amount_mg": 130.0,
+     "source_water_amount_mg": 270.0,
+     "actual_amount_mg": 400.0,
+     "relative_deviation": 0.0, "status": "ok"}
+  ]
+}
+```
+
+要点：
+
+- `source_water` 可选；不传（或只给部分元素）时对应原水浓度按 **0** 处理，结果与旧版完全一致（各元素 `source_water_amount_mg` 为 0）。
+- 元素名同样做大小写归一化（`ca` → `Ca`），未知元素 / 负数浓度返回 422。
+- 原水本身可能让某元素**必然超标**：例如目标 Ca 仅 10 mg/L，而原水 Ca=40 mg/L，即使浓缩液一滴不加，原水贡献也有约 400 mg（随求得水量浮动）。此时 `feasible=false`，`violations` 用同一贡献模型给出 `ELEMENT_SURPLUS` 与可达下界；供给不足时 `ELEMENT_SHORTAGE` 的可达上界同样包含原水贡献。
+- 保存配方版本与导出 JSON 会原样保留 `source_water` 输入；读取历史版本（无该字段）不受影响。
 
 ### 3. 保存配方版本
 

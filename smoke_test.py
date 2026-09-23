@@ -244,6 +244,142 @@ with TestClient(app) as client:
     print("15) untargeted/zero-target handling ok")
 
     # =================================================================== #
+    # Raw-water mineral baseline (source_water)
+    # =================================================================== #
+    # 10 L; target Ca=100, Mg=40 mg/L; raw water already carries
+    # Ca=40, Mg=30 mg/L; concentrate C has Ca=640, Mg=130 mg/L.
+    # Exact solution: C 1000 mL + water 9000 mL:
+    #   Ca: 1000*640/1000 + 9000*40/1000 = 640 + 360 = 1000 mg
+    #   Mg: 1000*130/1000 + 9000*30/1000 = 130 + 270 =  400 mg
+    def raw_request() -> dict:
+        return {
+            "target_volume_ml": 10000,
+            "targets": {"concentrations": {"Ca": 100, "Mg": 40}},
+            "concentrates": [
+                {"name": "C液", "available_volume": 2000,
+                 "concentrations": {"Ca": 640, "Mg": 130}}
+            ],
+            "source_water": {"concentrations": {"ca": 40, "mg": 30}},
+            "max_concentrate_fraction": 0.20,
+            "min_water_ml": 0,
+            "tolerance": 0.05,
+        }
+
+    # 28) raw-water baseline: contributions split per element ------------- #
+    r = client.post("/api/solve", json=raw_request())
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["feasible"] is True, data
+    alloc = {a["concentrate"]: a["volume_ml"] for a in data["allocations"]}
+    assert abs(alloc["C液"] - 1000) < 1e-4, alloc
+    assert abs(data["water_volume_ml"] - 9000) < 1e-4
+    rows = {e["element"]: e for e in data["elements"]}
+    assert abs(rows["Ca"]["concentrate_amount_mg"] - 640) < 1e-3
+    assert abs(rows["Ca"]["source_water_amount_mg"] - 360) < 1e-3
+    assert abs(rows["Ca"]["actual_amount_mg"] - 1000) < 1e-3
+    assert abs(rows["Mg"]["concentrate_amount_mg"] - 130) < 1e-3
+    assert abs(rows["Mg"]["source_water_amount_mg"] - 270) < 1e-3
+    assert abs(rows["Mg"]["actual_amount_mg"] - 400) < 1e-3
+    assert all(e["status"] == "ok" for e in data["elements"])
+    print("28) raw-water baseline split:",
+          {e: (rows[e]["concentrate_amount_mg"],
+               rows[e]["source_water_amount_mg"]) for e in rows})
+
+    # 29) the baseline scales with the SOLVED water volume, not a fixed
+    #     s*V pre-deduction: exact case yields 360 mg (40 mg/L * 9000 mL),
+    #     not 400 mg (40 mg/L * 10000 mL) ------------------------------- #
+    data = client.post("/api/solve", json=raw_request()).json()
+    w0 = data["water_volume_ml"]
+    ca0 = [e for e in data["elements"] if e["element"] == "Ca"][0]
+    assert abs(ca0["source_water_amount_mg"] - 0.04 * w0) < 1e-6
+    assert abs(ca0["source_water_amount_mg"] - 360) < 1e-3
+    # binding bottle cap forces a different compromise water share; the
+    # raw-water contribution must follow that solved water (x=800 -> w=9200)
+    capped = raw_request()
+    capped["concentrates"][0]["available_volume"] = 800
+    data = client.post("/api/solve", json=capped).json()
+    assert data["feasible"] is False, data  # Ca shortfall beyond tolerance
+    w = data["water_volume_ml"]
+    assert abs(data["concentrate_total_ml"] - 800) < 1e-4
+    assert abs(w - 9200) < 1e-4, w
+    for el in data["elements"]:
+        assert abs(
+            el["source_water_amount_mg"]
+            - {  # source mg = source mg/L * solved water L
+                "Ca": 0.04, "Mg": 0.03}[el["element"]] * w
+        ) < 1e-6
+        assert abs(
+            el["actual_amount_mg"]
+            - el["concentrate_amount_mg"] - el["source_water_amount_mg"]
+        ) < 1e-6
+    print("29) baseline tracks solved water (360 mg @9000 mL,",
+          "368 mg @9200 mL), never a fixed s*V deduction")
+
+    # 30) raw-water-forced surplus: target tiny but baseline unavoidable --- #
+    surplus = raw_request()
+    surplus["targets"] = {"concentrations": {"Ca": 10}}
+    data = client.post("/api/solve", json=surplus).json()
+    assert data["feasible"] is False, data
+    v = [x for x in data["violations"]
+         if x["code"] == "ELEMENT_SURPLUS" and x["element"] == "Ca"]
+    assert v, data["violations"]
+    # even with zero concentrate, ~100% water * 40 mg/L = ~400 mg baseline
+    assert abs(v[0]["actual"] - 400) < 1.0, v[0]
+    print("30) raw-water-forced surplus:", v[0]["message"])
+
+    # 31) shortage bound includes the baseline contribution --------------- #
+    short = raw_request()
+    short["concentrates"][0]["available_volume"] = 10
+    short["concentrates"][0]["concentrations"] = {"Ca": 1200, "Mg": 130}
+    data = client.post("/api/solve", json=short).json()
+    assert data["feasible"] is False
+    v = [x for x in data["violations"]
+         if x["code"] == "ELEMENT_SHORTAGE" and x["element"] == "Ca"]
+    assert v, data["violations"]
+    # max = 10 mL*1.2 mg/mL + 9990 mL water*0.04 mg/mL = 12 + 399.6
+    assert abs(v[0]["actual"] - 411.6) < 1e-3, v[0]
+    print("31) shortage reachable bound includes baseline:", v[0]["actual"])
+
+    # 32) source_water validation: unknown element / negative / typo -> 422 #
+    bad = raw_request()
+    bad["source_water"]["concentrations"]["Xx"] = 1
+    assert client.post("/api/solve", json=bad).status_code == 422
+    bad = raw_request()
+    bad["source_water"]["concentrations"]["Ca"] = -1
+    assert client.post("/api/solve", json=bad).status_code == 422
+    bad = raw_request()
+    bad["source_water"] = {"bogus": {"Ca": 1}}
+    assert client.post("/api/solve", json=bad).status_code == 422
+    print("32) source_water validation 422 ok")
+
+    # 33) saving preserves source_water; export echoes it back ------------- #
+    r = client.post("/api/recipes", json={
+        "name": "原水基线配方", "note": "v1", "request": raw_request()})
+    assert r.status_code == 201, r.text
+    sw_rid = r.json()["recipe_id"]
+    saved = client.get(
+        f"/api/recipes/{sw_rid}/versions/1").json()
+    assert saved["request"]["source_water"] == {
+        "concentrations": {"Ca": 40.0, "Mg": 30.0}}, saved["request"]
+    export = client.get(
+        f"/api/recipes/{sw_rid}/versions/1/export").json()
+    assert export["version"]["request"]["source_water"]["concentrations"] == {
+        "Ca": 40.0, "Mg": 30.0}
+    # result rows keep the split too
+    erows = {e["element"]: e
+             for e in export["version"]["result"]["elements"]}
+    assert abs(erows["Ca"]["source_water_amount_mg"] - 360) < 1e-3
+    print("33) save + export preserve source_water")
+
+    # 34) old requests without source_water behave exactly as before ------ #
+    legacy = client.post("/api/solve", json=base_request()).json()
+    assert legacy["feasible"] is True
+    assert all(e["source_water_amount_mg"] == 0.0
+               and e["concentrate_amount_mg"] == e["actual_amount_mg"]
+               for e in legacy["elements"])
+    print("34) legacy requests: zero baseline, unchanged results")
+
+    # =================================================================== #
     # Irrigation plan (POST /api/irrigation/plan)
     # =================================================================== #
     def irr_body(**overrides) -> dict:
